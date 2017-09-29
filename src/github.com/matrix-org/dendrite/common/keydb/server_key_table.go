@@ -98,7 +98,7 @@ func (s *serverKeyStatements) bulkSelectServerKeys(
 		var key string
 		var validUntilTS int64
 		var expiredTS int64
-		if err := rows.Scan(&serverName, &keyID, &key, &validUntilTS, &expiredTS); err != nil {
+		if err := rows.Scan(&serverName, &keyID, &validUntilTS, &expiredTS, &key); err != nil {
 			return nil, err
 		}
 		r := gomatrixserverlib.PublicKeyRequest{
