@@ -255,13 +255,15 @@ type PerspectiveKeyFetcher struct {
 // FetchKeys implements KeyFetcher
 func (p *PerspectiveKeyFetcher) FetchKeys(
 	ctx context.Context, requests map[PublicKeyRequest]Timestamp,
-) (map[PublicKeyRequest]ServerKeys, error) {
-	results, err := p.Client.LookupServerKeys(ctx, p.PerspectiveServerName, requests)
+) (map[PublicKeyRequest]PublicKeyLookupResult, error) {
+	serverKeys, err := p.Client.LookupServerKeys(ctx, p.PerspectiveServerName, requests)
 	if err != nil {
 		return nil, err
 	}
 
-	for req, keys := range results {
+	results := map[PublicKeyRequest]PublicKeyLookupResult{}
+
+	for req, keys := range serverKeys {
 		var valid bool
 		keyIDs, err := ListKeyIDs(string(p.PerspectiveServerName), keys.Raw)
 		if err != nil {
@@ -293,6 +295,8 @@ func (p *PerspectiveKeyFetcher) FetchKeys(
 			// This is bad because it means that the perspective server was trying to feed us an invalid response.
 			return nil, fmt.Errorf("gomatrixserverlib: key response from perspective server failed checks")
 		}
+
+		mapServerKeysToPublicKeyLookupResult(keys, results)
 	}
 
 	return results, nil
@@ -350,28 +354,31 @@ func (d *DirectKeyFetcher) fetchKeysForServer(
 			return nil, fmt.Errorf("gomatrixserverlib: key response direct from %q failed checks", serverName)
 		}
 
-		for keyID, key := range keys.VerifyKeys {
-			results[PublicKeyRequest{
-				ServerName: serverName,
-				KeyID:      keyID,
-			}] = PublicKeyLookupResult{
-				VerifyKey:    key,
-				ValidUntilTS: keys.ValidUntilTS,
-				ExpiredTS:    PublicKeyNotExpired,
-			}
-		}
-
-		for keyID, key := range keys.OldVerifyKeys {
-			results[PublicKeyRequest{
-				ServerName: serverName,
-				KeyID:      keyID,
-			}] = PublicKeyLookupResult{
-				VerifyKey:    key.VerifyKey,
-				ValidUntilTS: PublicKeyNotValid,
-				ExpiredTS:    key.ExpiredTS,
-			}
-		}
+		mapServerKeysToPublicKeyLookupResult(keys, results)
 	}
 
 	return results, nil
+}
+
+func mapServerKeysToPublicKeyLookupResult(serverKeys ServerKeys, results map[PublicKeyRequest]PublicKeyLookupResult) {
+	for keyID, key := range serverKeys.VerifyKeys {
+		results[PublicKeyRequest{
+			ServerName: serverKeys.ServerName,
+			KeyID:      keyID,
+		}] = PublicKeyLookupResult{
+			VerifyKey:    key,
+			ValidUntilTS: serverKeys.ValidUntilTS,
+			ExpiredTS:    PublicKeyNotExpired,
+		}
+	}
+	for keyID, key := range serverKeys.OldVerifyKeys {
+		results[PublicKeyRequest{
+			ServerName: serverKeys.ServerName,
+			KeyID:      keyID,
+		}] = PublicKeyLookupResult{
+			VerifyKey:    key.VerifyKey,
+			ValidUntilTS: PublicKeyNotValid,
+			ExpiredTS:    key.ExpiredTS,
+		}
+	}
 }
