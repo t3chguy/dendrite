@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pkg/errors"
 	"golang.org/x/crypto/ed25519"
 )
 
@@ -15,6 +16,30 @@ type PublicKeyRequest struct {
 	ServerName ServerName
 	// The ID of the key to fetch.
 	KeyID KeyID
+}
+
+const PublicKeyNotExpired = Timestamp(0)
+const PublicKeyNotValid = Timestamp(0)
+
+// A PublicKeyLookupResult is the result of looking up a server signing key.
+type PublicKeyLookupResult struct {
+	VerifyKey
+	// if this key has expired, the time it stopped being valid for event signing in milliseconds.
+	// if the key has not expired, the magic value PublicKeyNotExpired.
+	ExpiredTS Timestamp
+	// When this result is valid until in milliseconds.
+	// if the key has expired, the magic value PublicKeyNotValid.
+	ValidUntilTS Timestamp
+}
+
+func (r PublicKeyLookupResult) WasValidAt(atTs Timestamp) bool {
+	if r.ExpiredTS != PublicKeyNotExpired && atTs >= r.ExpiredTS {
+		return false
+	}
+	if r.ValidUntilTS == PublicKeyNotValid || atTs > r.ValidUntilTS {
+		return false
+	}
+	return true
 }
 
 // A KeyFetcher is a way of fetching public keys in bulk.
@@ -27,7 +52,7 @@ type KeyFetcher interface {
 	// The result may have fewer (server name, key ID) pairs than were in the request.
 	// The result may have more (server name, key ID) pairs than were in the request.
 	// Returns an error if there was a problem fetching the keys.
-	FetchKeys(ctx context.Context, requests map[PublicKeyRequest]Timestamp) (map[PublicKeyRequest]ServerKeys, error)
+	FetchKeys(ctx context.Context, requests map[PublicKeyRequest]Timestamp) (map[PublicKeyRequest]PublicKeyLookupResult, error)
 }
 
 // A KeyDatabase is a store for caching public keys.
@@ -40,7 +65,7 @@ type KeyDatabase interface {
 	// to a concurrent FetchKeys(). This is acceptable since the database is
 	// only used as a cache for the keys, so if a FetchKeys() races with a
 	// StoreKeys() and some of the keys are missing they will be just be refetched.
-	StoreKeys(ctx context.Context, results map[PublicKeyRequest]ServerKeys) error
+	StoreKeys(ctx context.Context, results map[PublicKeyRequest]PublicKeyLookupResult) error
 }
 
 // A KeyRing stores keys for matrix servers and provides methods for verifying JSON messages.
@@ -87,7 +112,7 @@ func (k KeyRing) VerifyJSONs(ctx context.Context, requests []VerifyJSONRequest) 
 	for i := range requests {
 		ids, err := ListKeyIDs(string(requests[i].ServerName), requests[i].Message)
 		if err != nil {
-			results[i].Error = fmt.Errorf("gomatrixserverlib: error extracting key IDs")
+			results[i].Error = errors.Wrap(err, "gomatrixserverlib: error extracting key IDs")
 			continue
 		}
 		for _, keyID := range ids {
@@ -123,6 +148,8 @@ func (k KeyRing) VerifyJSONs(ctx context.Context, requests []VerifyJSONRequest) 
 	k.checkUsingKeys(requests, results, keyIDs, keysFromDatabase)
 
 	for i := range k.KeyFetchers {
+		// TODO: we should distinguish here between expired keys, and those we don't have.
+		// If the key has expired, it's no use re-requesting it.
 		keyRequests := k.publicKeyRequests(requests, results, keyIDs)
 		if len(keyRequests) == 0 {
 			// There aren't any keys to fetch so we can stop here.
@@ -178,7 +205,7 @@ func (k *KeyRing) publicKeyRequests(
 
 func (k *KeyRing) checkUsingKeys(
 	requests []VerifyJSONRequest, results []VerifyJSONResult, keyIDs [][]KeyID,
-	keys map[PublicKeyRequest]ServerKeys,
+	keys map[PublicKeyRequest]PublicKeyLookupResult,
 ) {
 	for i := range requests {
 		if results[i].Error == nil {
@@ -187,13 +214,12 @@ func (k *KeyRing) checkUsingKeys(
 			continue
 		}
 		for _, keyID := range keyIDs[i] {
-			serverKeys, ok := keys[PublicKeyRequest{requests[i].ServerName, keyID}]
+			serverKey, ok := keys[PublicKeyRequest{requests[i].ServerName, keyID}]
 			if !ok {
 				// No key for this key ID so we continue onto the next key ID.
 				continue
 			}
-			publicKey := serverKeys.PublicKey(keyID, requests[i].AtTS)
-			if publicKey == nil {
+			if !serverKey.WasValidAt(requests[i].AtTS) {
 				// The key wasn't valid at the timestamp we needed it to be valid at.
 				// So skip onto the next key.
 				results[i].Error = fmt.Errorf(
@@ -203,7 +229,7 @@ func (k *KeyRing) checkUsingKeys(
 				continue
 			}
 			if err := VerifyJSON(
-				string(requests[i].ServerName), keyID, ed25519.PublicKey(publicKey), requests[i].Message,
+				string(requests[i].ServerName), keyID, ed25519.PublicKey(serverKey.Key), requests[i].Message,
 			); err != nil {
 				// The signature wasn't valid, record the error and try the next key ID.
 				results[i].Error = err
@@ -282,7 +308,7 @@ type DirectKeyFetcher struct {
 // FetchKeys implements KeyFetcher
 func (d *DirectKeyFetcher) FetchKeys(
 	ctx context.Context, requests map[PublicKeyRequest]Timestamp,
-) (map[PublicKeyRequest]ServerKeys, error) {
+) (map[PublicKeyRequest]PublicKeyLookupResult, error) {
 	byServer := map[ServerName]map[PublicKeyRequest]Timestamp{}
 	for req, ts := range requests {
 		server := byServer[req.ServerName]
@@ -293,7 +319,7 @@ func (d *DirectKeyFetcher) FetchKeys(
 		server[req] = ts
 	}
 
-	results := map[PublicKeyRequest]ServerKeys{}
+	results := map[PublicKeyRequest]PublicKeyLookupResult{}
 	for server, reqs := range byServer {
 		// TODO: make these requests in parallel
 		serverResults, err := d.fetchKeysForServer(ctx, server, reqs)
@@ -310,17 +336,40 @@ func (d *DirectKeyFetcher) FetchKeys(
 
 func (d *DirectKeyFetcher) fetchKeysForServer(
 	ctx context.Context, serverName ServerName, requests map[PublicKeyRequest]Timestamp,
-) (map[PublicKeyRequest]ServerKeys, error) {
-	results, err := d.Client.LookupServerKeys(ctx, serverName, requests)
+) (map[PublicKeyRequest]PublicKeyLookupResult, error) {
+	serverKeys, err := d.Client.LookupServerKeys(ctx, serverName, requests)
 	if err != nil {
 		return nil, err
 	}
 
-	for req, keys := range results {
+	results := map[PublicKeyRequest]PublicKeyLookupResult{}
+	for req, keys := range serverKeys {
 		// Check that the keys are valid for the server.
 		checks, _, _ := CheckKeys(req.ServerName, time.Unix(0, 0), keys, nil)
 		if !checks.AllChecksOK {
 			return nil, fmt.Errorf("gomatrixserverlib: key response direct from %q failed checks", serverName)
+		}
+
+		for keyID, key := range keys.VerifyKeys {
+			results[PublicKeyRequest{
+				ServerName: serverName,
+				KeyID:      keyID,
+			}] = PublicKeyLookupResult{
+				VerifyKey:    key,
+				ValidUntilTS: keys.ValidUntilTS,
+				ExpiredTS:    PublicKeyNotExpired,
+			}
+		}
+
+		for keyID, key := range keys.OldVerifyKeys {
+			results[PublicKeyRequest{
+				ServerName: serverName,
+				KeyID:      keyID,
+			}] = PublicKeyLookupResult{
+				VerifyKey:    key.VerifyKey,
+				ValidUntilTS: PublicKeyNotValid,
+				ExpiredTS:    key.ExpiredTS,
+			}
 		}
 	}
 
