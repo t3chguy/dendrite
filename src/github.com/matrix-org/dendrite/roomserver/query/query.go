@@ -418,6 +418,52 @@ func (r *RoomserverQueryAPI) QueryServerAllowedToSeeEvent(
 	return nil
 }
 
+func (r *RoomserverQueryAPI) QueryStateAndAuthChain(
+	ctx context.Context,
+	request *api.QueryStateAndAuthChainRequest,
+	response *api.QueryStateAndAuthChainResponse,
+) error {
+	response.QueryStateAndAuthChainRequest = *request
+	roomNID, err := r.DB.RoomNID(ctx, request.RoomID)
+	if err != nil {
+		return err
+	}
+	if roomNID == 0 {
+		return nil
+	}
+	response.RoomExists = true
+
+	prevStates, err := r.DB.StateAtEventIDs(ctx, request.PrevEventIDs)
+	if err != nil {
+		switch err.(type) {
+		case types.MissingEventError:
+			return nil
+		default:
+			return err
+		}
+	}
+	response.PrevEventsExist = true
+
+	// Look up the currrent state for the requested tuples.
+	stateEntries, err := state.LoadCombinedStateAfterEvents(
+		ctx, r.DB, prevStates,
+	)
+	if err != nil {
+		return err
+	}
+
+	stateEvents, err := r.loadStateEvents(ctx, stateEntries)
+	if err != nil {
+		return err
+	}
+
+	response.StateEvents = stateEvents
+
+	// TODO: Auth chain
+
+	return nil
+}
+
 // SetupHTTP adds the RoomserverQueryAPI handlers to the http.ServeMux.
 // nolint: gocyclo
 func (r *RoomserverQueryAPI) SetupHTTP(servMux *http.ServeMux) {
