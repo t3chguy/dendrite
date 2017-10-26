@@ -418,6 +418,7 @@ func (r *RoomserverQueryAPI) QueryServerAllowedToSeeEvent(
 	return nil
 }
 
+// QueryStateAndAuthChain implements api.RoomserverQueryAPI
 func (r *RoomserverQueryAPI) QueryStateAndAuthChain(
 	ctx context.Context,
 	request *api.QueryStateAndAuthChainRequest,
@@ -458,10 +459,72 @@ func (r *RoomserverQueryAPI) QueryStateAndAuthChain(
 	}
 
 	response.StateEvents = stateEvents
+	response.AuthChainEvents, err = r.getAuthChain(ctx, request.PrevEventIDs)
+	return err
+}
 
-	// TODO: Auth chain
+// getAuthChain fetches the auth chain for the given events.
+// An auth chain is the list of all events that are referenced in the
+// auth_events section, and all their auth_events, recursively.
+// The returned set of events do not contain the given events, unless they are
+// part of the auth chain for another event.
+// Will *not* error if we don't have all auth events.
+func (r *RoomserverQueryAPI) getAuthChain(
+	ctx context.Context, eventIDs []string,
+) ([]gomatrixserverlib.Event, error) {
+	var authEvents []gomatrixserverlib.Event
 
-	return nil
+	// Set of events not to add to the returned list, e.g. due to  having
+	// already been added.
+	seenEventMap := make(map[string]bool)
+	for _, eventID := range eventIDs {
+		seenEventMap[eventID] = true
+	}
+
+	// List of event ids to fetch auth events for next
+	eventsToFetch := eventIDs
+
+	for {
+		// Check if there's anything left to do
+		if len(eventsToFetch) == 0 {
+			break
+		}
+
+		// Convert eventIDs to events. First need to fetch NIDs
+		nidMap, err := r.DB.EventNIDs(ctx, eventIDs)
+		if err != nil {
+			return nil, err
+		}
+
+		var nids []types.EventNID
+		for _, nid := range nidMap {
+			nids = append(nids, nid)
+		}
+
+		events, err := r.DB.Events(ctx, nids)
+		if err != nil {
+			return nil, err
+		}
+
+		// Work out a) which events we should add to the returned list of
+		// events and b) which of the auth events we haven't seen yet and
+		// add them to the list of events to fetch.
+		eventsToFetch = nil
+		for _, event := range events {
+			for _, authEventID := range event.AuthEventIDs() {
+				if !seenEventMap[authEventID] {
+					eventsToFetch = append(eventsToFetch, authEventID)
+				}
+			}
+
+			if !seenEventMap[event.EventID()] {
+				seenEventMap[event.EventID()] = true
+				authEvents = append(authEvents, event.Event)
+			}
+		}
+	}
+
+	return authEvents, nil
 }
 
 // SetupHTTP adds the RoomserverQueryAPI handlers to the http.ServeMux.
