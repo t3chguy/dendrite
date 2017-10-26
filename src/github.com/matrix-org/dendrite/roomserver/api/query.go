@@ -155,7 +155,7 @@ type QueryServerAllowedToSeeEventResponse struct {
 	AllowedToSeeEvent bool `json:"can_see_event"`
 }
 
-// QueryStateAfterEventsRequest is a request to QueryStateAfterEvents
+// QueryStateAndAuthChainRequest is a request to QueryStateAndAuthChain
 type QueryStateAndAuthChainRequest struct {
 	// The room ID to query the state in.
 	RoomID string `json:"room_id"`
@@ -163,7 +163,7 @@ type QueryStateAndAuthChainRequest struct {
 	PrevEventIDs []string `json:"prev_event_ids"`
 }
 
-// QueryStateAfterEventsResponse is a response to QueryStateAfterEvents
+// QueryStateAndAuthChainResponse is a response to QueryStateAndAuthChain
 type QueryStateAndAuthChainResponse struct {
 	// Copy of the request for debugging.
 	QueryStateAndAuthChainRequest
